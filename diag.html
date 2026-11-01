@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Overpass Network Diagnostic</title>
+  <style>
+    * { box-sizing: border-box; font-family: monospace; }
+    body { padding: 12px; background: #0f172a; color: #f8fafc; font-size: 13px; line-height: 1.5; }
+    h1 { font-size: 15px; color: #38bdf8; margin: 0 0 10px 0; }
+    .btn-row { display: flex; gap: 8px; margin-bottom: 12px; }
+    button { flex: 1; padding: 12px; font-weight: bold; font-size: 13px; border: none; border-radius: 4px; cursor: pointer; }
+    #btnPost { background: #0284c7; color: white; }
+    #btnGet { background: #0d9488; color: white; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #log { background: #020617; border: 1px solid #334155; border-radius: 4px; padding: 10px; min-height: 240px; white-space: pre-wrap; word-break: break-all; }
+    .pass { color: #4ade80; }
+    .fail { color: #f87171; }
+    .info { color: #fbbf24; }
+  </style>
+</head>
+<body>
+
+  <h1>Overpass Connectivity &amp; Network Diagnostic</h1>
+  <div style="margin-bottom: 8px; color: #94a3b8; font-size: 11px;">
+    Query: [out:json][timeout:5]; node(51.372,-2.138,1000)["amenity"="pub"]; out 5;<br>
+    Target: overpass-api.de | Client timeout: 45 seconds | No fallbacks
+  </div>
+
+  <div class="btn-row">
+    <button id="btnPost" onclick="runTest('POST')">1. Test via POST (Standard)</button>
+    <button id="btnGet" onclick="runTest('GET')">2. Test via GET (Alternative)</button>
+  </div>
+
+  <div id="log">Ready. Tap button 1 to begin.</div>
+
+  <script>
+    const QUERY = '[out:json][timeout:5]; node(around:1000,51.372,-2.138)["amenity"="pub"]; out 5;';
+    const ENDPOINT = 'https://overpass-api.de/api/interpreter';
+    const CLIENT_TIMEOUT_MS = 45000;
+
+    function append(text, type) {
+      const log = document.getElementById('log');
+      const span = document.createElement('span');
+      if (type) span.className = type;
+      span.textContent = text + '\n';
+      log.appendChild(span);
+    }
+
+    async function runTest(method) {
+      const btnPost = document.getElementById('btnPost');
+      const btnGet = document.getElementById('btnGet');
+      const log = document.getElementById('log');
+      log.replaceChildren();
+
+      btnPost.disabled = true;
+      btnGet.disabled = true;
+
+      append(`=== STARTING ${method} DIAGNOSTIC ===`, 'info');
+      append(`Target URL : ${ENDPOINT}`);
+      append(`Payload    : ${QUERY}`);
+      append(`Max Wait   : ${CLIENT_TIMEOUT_MS / 1000}s\n`);
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => { controller.abort(); }, CLIENT_TIMEOUT_MS);
+      const t0 = performance.now();
+
+      let fetchPromise;
+      if (method === 'POST') {
+        fetchPromise = fetch(ENDPOINT, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'Accept': 'application/json'
+          },
+          body: 'data=' + encodeURIComponent(QUERY),
+          signal: controller.signal
+        });
+      } else {
+        const fullUrl = ENDPOINT + '?data=' + encodeURIComponent(QUERY);
+        fetchPromise = fetch(fullUrl, {
+          method: 'GET',
+          headers: { 'Accept': 'application/json' },
+          signal: controller.signal
+        });
+      }
+
+      try {
+        append(`Connecting to server...`);
+        const response = await fetchPromise;
+        clearTimeout(timer);
+        const timeToFirstResponse = Math.round(performance.now() - t0);
+
+        append(`\n--- CONNECTION ESTABLISHED ---`, 'pass');
+        append(`Time to first response : ${timeToFirstResponse}ms`, 'pass');
+        append(`HTTP Status Code       : ${response.status} ${response.statusText}`, response.ok ? 'pass' : 'fail');
+        append(`Response Type          : ${response.type}`);
+        append(`CORS Header Passed     : ${response.headers.get('access-control-allow-origin') || 'Not exposed or restricted'}`);
+
+        append(`\n--- READING BODY PAYLOAD ---`, 'info');
+        const rawText = await response.text();
+        append(`Payload size received  : ${rawText.length} bytes`);
+
+        let json = null;
+        try {
+          json = JSON.parse(rawText);
+          append(`JSON Parsing           : SUCCESS`, 'pass');
+        } catch (jsonErr) {
+          append(`JSON Parsing           : FAILED (Response was not valid JSON)`, 'fail');
+          append(`Raw response start     : ${rawText.substring(0, 300)}...`);
+          return;
+        }
+
+        const elements = json.elements || [];
+        append(`Elements returned      : ${elements.length}`, elements.length > 0 ? 'pass' : 'info');
+
+        if (elements.length > 0) {
+          append(`\n--- DISCOVERED PLACES ---`, 'pass');
+          elements.forEach((el, i) => {
+            const name = (el.tags && el.tags.name) ? el.tags.name : 'Unnamed';
+            append(`  ${i + 1}. [${el.type}/${el.id}] ${name} (${el.lat.toFixed(4)}, ${el.lon.toFixed(4)})`);
+          });
+        }
+
+        if (json.remark) {
+          append(`\nServer Remark          : ${json.remark}`, 'info');
+        }
+
+      } catch (err) {
+        clearTimeout(timer);
+        const elapsed = Math.round(performance.now() - t0);
+        append(`\n--- REQUEST FAILED (${elapsed}ms) ---`, 'fail');
+
+        if (err.name === 'AbortError') {
+          append(`Failure Classification : CLIENT TIMEOUT (Exceeded ${CLIENT_TIMEOUT_MS / 1000}s limit)`, 'fail');
+          append(`Details                : The server never sent headers or completed the TLS handshake.`);
+        } else if (err instanceof TypeError && err.message.toLowerCase().includes('failed to fetch')) {
+          append(`Failure Classification : CORS OR NETWORK-LEVEL BLOCK`, 'fail');
+          append(`Details                : The browser refused to connect. This occurs if DNS failed, the ISP/Wi-Fi blocked the domain, or CORS headers were stripped.`);
+        } else {
+          append(`Failure Classification : OTHER NETWORK ERROR`, 'fail');
+          append(`Details                : ${err.name} - ${err.message}`);
+        }
+      } finally {
+        btnPost.disabled = false;
+        btnGet.disabled = false;
+        append(`\n=== TEST COMPLETE ===`, 'info');
+      }
+    }
+  </script>
+</body>
+</html>
