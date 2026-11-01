@@ -3,41 +3,50 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Overpass Network Diagnostic</title>
+  <title>Overpass Server Queue Benchmark</title>
   <style>
     * { box-sizing: border-box; font-family: monospace; }
     body { padding: 12px; background: #0f172a; color: #f8fafc; font-size: 13px; line-height: 1.5; }
     h1 { font-size: 15px; color: #38bdf8; margin: 0 0 10px 0; }
-    .btn-row { display: flex; gap: 8px; margin-bottom: 12px; }
-    button { flex: 1; padding: 12px; font-weight: bold; font-size: 13px; border: none; border-radius: 4px; cursor: pointer; }
-    #btnPost { background: #0284c7; color: white; }
-    #btnGet { background: #0d9488; color: white; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+    button { padding: 10px; font-weight: bold; font-size: 12px; border: none; border-radius: 4px; cursor: pointer; color: white; }
+    .btn-all { grid-column: 1 / -1; background: #2563eb; padding: 12px; font-size: 13px; }
+    .btn-ep { background: #0f766e; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
     #log { background: #020617; border: 1px solid #334155; border-radius: 4px; padding: 10px; min-height: 240px; white-space: pre-wrap; word-break: break-all; }
     .pass { color: #4ade80; }
     .fail { color: #f87171; }
     .info { color: #fbbf24; }
+    .lead { color: #a855f7; font-weight: bold; }
   </style>
 </head>
 <body>
 
-  <h1>Overpass Connectivity &amp; Network Diagnostic</h1>
+  <h1>Overpass Instance Queue Benchmark</h1>
   <div style="margin-bottom: 8px; color: #94a3b8; font-size: 11px;">
-    Query: [out:json][timeout:5]; node(51.372,-2.138,1000)["amenity"="pub"]; out 5;<br>
-    Target: overpass-api.de | Client timeout: 45 seconds | No fallbacks
+    Query: 5 Melksham pubs (1km) | Client timeout: 45s per test | No auto-abort
   </div>
 
   <div class="btn-row">
-    <button id="btnPost" onclick="runTest('POST')">1. Test via POST (Standard)</button>
-    <button id="btnGet" onclick="runTest('GET')">2. Test via GET (Alternative)</button>
+    <button id="btnAll" class="btn-all" onclick="benchmarkAll()">Run Full Benchmark (All 4 Servers)</button>
+    <button class="btn-ep" onclick="benchmarkSingle(0)">1. overpass-api.de</button>
+    <button class="btn-ep" onclick="benchmarkSingle(1)">2. lz4 cluster</button>
+    <button class="btn-ep" onclick="benchmarkSingle(2)">3. private.coffee</button>
+    <button class="btn-ep" onclick="benchmarkSingle(3)">4. kumi.systems</button>
   </div>
 
-  <div id="log">Ready. Tap button 1 to begin.</div>
+  <div id="log">Ready. Tap 'Run Full Benchmark' to test each queue sequentially.</div>
 
   <script>
-    const QUERY = '[out:json][timeout:5]; node(around:1000,51.372,-2.138)["amenity"="pub"]; out 5;';
-    const ENDPOINT = 'https://overpass-api.de/api/interpreter';
+    const QUERY = '[out:json][timeout:10]; node(around:1000,51.372,-2.138)["amenity"="pub"]; out 5;';
     const CLIENT_TIMEOUT_MS = 45000;
+
+    const ENDPOINTS = [
+      { name: 'overpass-api.de (Main)', url: 'https://overpass-api.de/api/interpreter' },
+      { name: 'lz4.overpass-api.de (LZ4 Cluster)', url: 'https://lz4.overpass-api.de/api/interpreter' },
+      { name: 'overpass.private.coffee (Mirror)', url: 'https://overpass.private.coffee/api/interpreter' },
+      { name: 'overpass.kumi.systems (UK/EU CDN)', url: 'https://overpass.kumi.systems/api/interpreter' }
+    ];
 
     function append(text, type) {
       const log = document.getElementById('log');
@@ -47,27 +56,19 @@
       log.appendChild(span);
     }
 
-    async function runTest(method) {
-      const btnPost = document.getElementById('btnPost');
-      const btnGet = document.getElementById('btnGet');
-      const log = document.getElementById('log');
-      log.replaceChildren();
+    function setButtonsDisabled(state) {
+      const btns = document.querySelectorAll('button');
+      btns.forEach(b => b.disabled = state);
+    }
 
-      btnPost.disabled = true;
-      btnGet.disabled = true;
-
-      append(`=== STARTING ${method} DIAGNOSTIC ===`, 'info');
-      append(`Target URL : ${ENDPOINT}`);
-      append(`Payload    : ${QUERY}`);
-      append(`Max Wait   : ${CLIENT_TIMEOUT_MS / 1000}s\n`);
-
+    async function testEndpoint(ep) {
+      append(`Testing: ${ep.name}...`);
       const controller = new AbortController();
-      const timer = setTimeout(() => { controller.abort(); }, CLIENT_TIMEOUT_MS);
+      const timer = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
       const t0 = performance.now();
 
-      let fetchPromise;
-      if (method === 'POST') {
-        fetchPromise = fetch(ENDPOINT, {
+      try {
+        const res = await fetch(ep.url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -76,76 +77,68 @@
           body: 'data=' + encodeURIComponent(QUERY),
           signal: controller.signal
         });
-      } else {
-        const fullUrl = ENDPOINT + '?data=' + encodeURIComponent(QUERY);
-        fetchPromise = fetch(fullUrl, {
-          method: 'GET',
-          headers: { 'Accept': 'application/json' },
-          signal: controller.signal
-        });
-      }
 
-      try {
-        append(`Connecting to server...`);
-        const response = await fetchPromise;
         clearTimeout(timer);
-        const timeToFirstResponse = Math.round(performance.now() - t0);
+        const elapsed = Math.round(performance.now() - t0);
 
-        append(`\n--- CONNECTION ESTABLISHED ---`, 'pass');
-        append(`Time to first response : ${timeToFirstResponse}ms`, 'pass');
-        append(`HTTP Status Code       : ${response.status} ${response.statusText}`, response.ok ? 'pass' : 'fail');
-        append(`Response Type          : ${response.type}`);
-        append(`CORS Header Passed     : ${response.headers.get('access-control-allow-origin') || 'Not exposed or restricted'}`);
-
-        append(`\n--- READING BODY PAYLOAD ---`, 'info');
-        const rawText = await response.text();
-        append(`Payload size received  : ${rawText.length} bytes`);
-
-        let json = null;
-        try {
-          json = JSON.parse(rawText);
-          append(`JSON Parsing           : SUCCESS`, 'pass');
-        } catch (jsonErr) {
-          append(`JSON Parsing           : FAILED (Response was not valid JSON)`, 'fail');
-          append(`Raw response start     : ${rawText.substring(0, 300)}...`);
-          return;
+        if (!res.ok) {
+          append(`  -> HTTP ${res.status} (${elapsed}ms)`, 'fail');
+          return { name: ep.name, ok: false, status: res.status, elapsed };
         }
 
-        const elements = json.elements || [];
-        append(`Elements returned      : ${elements.length}`, elements.length > 0 ? 'pass' : 'info');
+        const raw = await res.text();
+        const json = JSON.parse(raw);
+        const count = (json.elements || []).length;
 
-        if (elements.length > 0) {
-          append(`\n--- DISCOVERED PLACES ---`, 'pass');
-          elements.forEach((el, i) => {
-            const name = (el.tags && el.tags.name) ? el.tags.name : 'Unnamed';
-            append(`  ${i + 1}. [${el.type}/${el.id}] ${name} (${el.lat.toFixed(4)}, ${el.lon.toFixed(4)})`);
-          });
-        }
-
-        if (json.remark) {
-          append(`\nServer Remark          : ${json.remark}`, 'info');
-        }
+        append(`  -> HTTP 200 OK | Queue + Execution: ${elapsed}ms | Results: ${count}`, 'pass');
+        return { name: ep.name, ok: true, status: 200, elapsed, count };
 
       } catch (err) {
         clearTimeout(timer);
         const elapsed = Math.round(performance.now() - t0);
-        append(`\n--- REQUEST FAILED (${elapsed}ms) ---`, 'fail');
-
-        if (err.name === 'AbortError') {
-          append(`Failure Classification : CLIENT TIMEOUT (Exceeded ${CLIENT_TIMEOUT_MS / 1000}s limit)`, 'fail');
-          append(`Details                : The server never sent headers or completed the TLS handshake.`);
-        } else if (err instanceof TypeError && err.message.toLowerCase().includes('failed to fetch')) {
-          append(`Failure Classification : CORS OR NETWORK-LEVEL BLOCK`, 'fail');
-          append(`Details                : The browser refused to connect. This occurs if DNS failed, the ISP/Wi-Fi blocked the domain, or CORS headers were stripped.`);
-        } else {
-          append(`Failure Classification : OTHER NETWORK ERROR`, 'fail');
-          append(`Details                : ${err.name} - ${err.message}`);
-        }
-      } finally {
-        btnPost.disabled = false;
-        btnGet.disabled = false;
-        append(`\n=== TEST COMPLETE ===`, 'info');
+        const reason = err.name === 'AbortError' ? 'Timeout >45s' : err.message;
+        append(`  -> FAILED (${elapsed}ms): ${reason}`, 'fail');
+        return { name: ep.name, ok: false, status: reason, elapsed };
       }
+    }
+
+    async function benchmarkSingle(index) {
+      setButtonsDisabled(true);
+      const log = document.getElementById('log');
+      log.replaceChildren();
+      append(`=== TESTING SINGLE ENDPOINT ===\n`, 'info');
+      await testEndpoint(ENDPOINTS[index]);
+      append(`\n=== COMPLETE ===`, 'info');
+      setButtonsDisabled(false);
+    }
+
+    async function benchmarkAll() {
+      setButtonsDisabled(true);
+      const log = document.getElementById('log');
+      log.replaceChildren();
+      append(`=== STARTING COMPARATIVE BENCHMARK ===\n`, 'info');
+
+      const results = [];
+      for (const ep of ENDPOINTS) {
+        const res = await testEndpoint(ep);
+        results.push(res);
+        append(''); // Blank line spacer
+      }
+
+      append(`=== SUMMARY TABLE ===`, 'lead');
+      results.forEach(r => {
+        const tag = r.ok ? `SUCCESS (${r.elapsed}ms)` : `FAILED (${r.status} in ${r.elapsed}ms)`;
+        append(`${r.name.padEnd(35)} : ${tag}`, r.ok ? 'pass' : 'fail');
+      });
+
+      const successful = results.filter(r => r.ok).sort((a, b) => a.elapsed - b.elapsed);
+      if (successful.length > 0) {
+        append(`\nFastest active server: ${successful[0].name} (${successful[0].elapsed}ms)`, 'pass');
+      } else {
+        append(`\nAll servers failed or timed out.`, 'fail');
+      }
+
+      setButtonsDisabled(false);
     }
   </script>
 </body>
