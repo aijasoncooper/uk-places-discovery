@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>UK Places Discovery - Technical PoC (Option A)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { margin: 0; padding: 10px; background: #f4f5f7; color: #1f2937; font-size: 14px; }
+    h1 { font-size: 16px; margin: 0 0 8px 0; }
+    .panel { background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #d1d5db; margin-bottom: 10px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+    .full { grid-column: 1 / -1; }
+    input, select, button { width: 100%; padding: 9px; border: 1px solid #9ca3af; border-radius: 4px; font-size: 14px; background: #fff; }
+    button.primary { background: #1d4ed8; color: #fff; border: none; font-weight: 600; cursor: pointer; }
+    button.primary:disabled { background: #6b7280; cursor: wait; }
+    #telemetry { font-family: monospace; font-size: 12px; background: #111827; color: #10b981; padding: 8px; border-radius: 4px; margin-bottom: 10px; white-space: pre-wrap; line-height: 1.4; }
+    #telemetry.error { color: #f87171; }
+    #map { height: 280px; width: 100%; border-radius: 6px; border: 1px solid #d1d5db; margin-bottom: 10px; }
+    .tabs { display: flex; gap: 6px; margin-bottom: 8px; }
+    .tab-btn { flex: 1; padding: 8px; background: #e5e7eb; border: none; border-radius: 4px; font-weight: 600; cursor: pointer; }
+    .tab-btn.active { background: #1f2937; color: #fff; }
+    .card { background: #fff; padding: 10px; border-radius: 6px; border: 1px solid #e5e7eb; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
+    .card-info { flex: 1; padding-right: 8px; cursor: pointer; }
+    .card-title { font-weight: 600; margin-bottom: 4px; }
+    .card-meta { font-size: 12px; color: #4b5563; line-height: 1.4; }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px; font-weight: 600; }
+    .badge.type { background: #e0e7ff; color: #1e40af; }
+    .badge.verified { background: #dcfce7; color: #166534; }
+    .badge.uncertain { background: #fef9c3; color: #854d0e; }
+    .fav-btn { width: auto; padding: 6px 10px; font-size: 12px; background: #f3f4f6; border: 1px solid #d1d5db; cursor: pointer; flex-shrink: 0; }
+    .fav-btn.saved { background: #fef08a; border-color: #eab308; font-weight: 600; }
+  </style>
+</head>
+<body>
+
+  <div class="panel">
+    <h1>UK Places Discovery - Technical PoC (Option A)</h1>
+    <div class="grid">
+      <input type="text" id="locationInput" class="full" placeholder="Postcode (e.g. SN12 6AA) or Town (e.g. Melksham)" value="Melksham">
+      <select id="radiusSelect">
+        <option value="10" selected>10 Miles</option>
+        <option value="25">25 Miles</option>
+        <option value="50">50 Miles</option>
+        <option value="100">100 Miles</option>
+      </select>
+      <select id="categorySelect">
+        <option value="nt">1. National Trust</option>
+        <option value="eh">2. English Heritage</option>
+        <option value="ccc">3. Camping &amp; Caravanning Club</option>
+        <option value="castles">4. Castles &amp; Historic Ruins</option>
+        <option value="museums">5. Museums</option>
+        <option value="nature">6. Nature Reserves</option>
+        <option value="parks">7. Country Parks</option>
+        <option value="viewpoints">8. Viewpoints</option>
+        <option value="all">9. All Categories (Tiered Test)</option>
+      </select>
+      <button id="searchBtn" class="primary full" type="button">Run Technical Test</button>
+    </div>
+  </div>
+
+  <div id="telemetry">Initialising technical test environment...</div>
+  <div id="map"></div>
+
+  <div class="tabs">
+    <button id="tabResults" class="tab-btn active" type="button">Search Results (<span id="resCount">0</span>)</button>
+    <button id="tabFavs" class="tab-btn" type="button">Saved Favourites (<span id="favCount">0</span>)</button>
+  </div>
+
+  <div id="listContainer"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    (function() {
+      const FAV_KEY = 'uk_places_poc_favs_v2';
+      const MAX_UI_RENDER = 300;
+      const OVERPASS_ENDPOINT = 'https://overpass-api.de/api/interpreter';
+      const CLIENT_TIMEOUT_MS = 60000; // 60s ceiling accommodates the public queue backlog
+
+      let map = null;
+      let markersLayer = null;
+      let centerCircle = null;
+      let markerById = new Map();
+      let currentResults = [];
+      let lastSearchMeta = null;
+      let activeTab = 'results';
+      let memoryFavs = [];
+      let storageAvailable = false;
+      let timerInterval = null;
+
+      // 1. Safe Storage Wrapper
+      function checkStorage() {
+        try {
+          const testKey = '__poc_storage_test__';
+          window.localStorage.setItem(testKey, '1');
+          window.localStorage.removeItem(testKey);
+          storageAvailable = true;
+          return 'YES (localStorage writable)';
+        } catch (err) {
+          storageAvailable = false;
+          return 'NO (Fallback to session memory)';
+        }
+      }
+
+      function getFavs() {
+        if (!storageAvailable) return memoryFavs.slice();
+        try {
+          const raw = window.localStorage.getItem(FAV_KEY);
+          if (!raw) return [];
+          const parsed = JSON.parse(raw);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch (err) {
+          return memoryFavs.slice();
+        }
+      }
+
+      function saveFavs(favArray) {
+        memoryFavs = favArray.slice();
+        if (!storageAvailable) return;
+        try {
+          window.localStorage.setItem(FAV_KEY, JSON.stringify(favArray));
+        } catch (err) {
+          storageAvailable = false;
+        }
+      }
+
+      function logTelemetry(msg, isError) {
+        const el = document.getElementById('telemetry');
+        el.textContent = msg;
+        el.className = isError ? 'error' : '';
+      }
+
+      // 2. Network Fetch with Timeout
+      async function fetchWithTimeout(url, options, timeoutMs) {
+        const controller = new AbortController();
+        const timer = setTimeout(function() { controller.abort(); }, timeoutMs);
+        try {
+          const response = await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+          clearTimeout(timer);
+          return response;
+        } catch (err) {
+          clearTimeout(timer);
+          if (err.name === 'AbortError') {
+            throw new Error('Connection timed out after ' + Math.round(timeoutMs / 1000) + ' seconds.');
+          }
+          throw new Error('Network error (' + (err.message || 'fetch failed') + ')');
+        }
+      }
+
+      // 3. Geocoding Layer
+      async function geocodeInput(rawInput) {
+        const cleaned = (rawInput || '').trim();
+        if (!cleaned) throw new Error('Please enter a UK postcode or town name.');
+
+        const ukPostcodeRegex = /^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$/i;
+        const outcodeRegex = /^[A-Z]{1,2}\d[A-Z\d]?$/i;
+        const t0 = performance.now();
+
+        if (ukPostcodeRegex.test(cleaned) || outcodeRegex.test(cleaned)) {
+          const isFull = ukPostcodeRegex.test(cleaned);
+          const endpoint = isFull
+            ? 'https://api.postcodes.io/postcodes/' + encodeURIComponent(cleaned)
+            : 'https://api.postcodes.io/outcodes/' + encodeURIComponent(cleaned);
+
+          const res = await fetchWithTimeout(endpoint, {}, 10000);
+          if (res.status === 404) throw new Error('Postcode "' + cleaned + '" not found by Postcodes.io.');
+          if (!res.ok) throw new Error('Postcodes.io HTTP ' + res.status);
+          const data = await res.json();
+          if (!data || !data.result || typeof data.result.latitude !== 'number') {
+            throw new Error('Postcodes.io returned invalid coordinates.');
+          }
+          return {
+            lat: data.result.latitude,
+            lon: data.result.longitude,
+            label: data.result.postcode || data.result.outcode || cleaned.toUpperCase(),
+            source: 'Postcodes.io',
+            ms: Math.round(performance.now() - t0)
+          };
+        } else {
+          const url = 'https://nominatim.openstreetmap.org/search?format=json&countrycodes=gb&limit=1&q=' + encodeURIComponent(cleaned);
+          const res = await fetchWithTimeout(url, { headers: { 'Accept-Language': 'en-GB' } }, 10000);
+          if (res.status === 429) throw new Error('Nominatim rate limit reached. Wait 2 seconds and retry.');
+          if (!res.ok) throw new Error('Nominatim HTTP ' + res.status);
+          const data = await res.json();
+          if (!Array.isArray(data) || data.length === 0) {
+            throw new Error('No UK town found matching "' + cleaned + '".');
+          }
+          return {
+            lat: parseFloat(data[0].lat),
+            lon: parseFloat(data[0].lon),
+            label: String(data[0].display_name || cleaned).split(',')[0],
+            source: 'OSM Nominatim',
+            ms: Math.round(performance.now() - t0)
+          };
+        }
+      }
+
+      // 4. Bounding Box Conversion
+      function getBoundingBox(lat, lon, radiusMiles) {
+        const latDelta = radiusMiles / 69.0;
+        const lonDelta = radiusMiles / (69.0 * Math.cos(lat * Math.PI / 180));
+        const south = (lat - latDelta).toFixed(4);
+        const west = (lon - lonDelta).toFixed(4);
+        const north = (lat + latDelta).toFixed(4);
+        const east = (lon + lonDelta).toFixed(4);
+        return south + ',' + west + ',' + north + ',' + east;
+      }
+
+      // 5. Overpass Query Builder
+      function buildOverpassQuery(category, lat, lon, radiusMiles) {
+        const bbox = getBoundingBox(lat, lon, radiusMiles);
+        const isWide = radiusMiles >= 50;
+        const serverTimeout = isWide ? 25 : 15;
+
+        let body = '';
+        let strategyNote = 'BBox index search + client distance sort';
+
+        switch (category) {
+          case 'nt':
+            body = '(' +
+              'nwr["operator:wikidata"="Q333515"]["name"];' +
+              'nwr["operator"="National Trust"]["name"];' +
+              'nwr["operator"="The National Trust"]["name"];' +
+            ');';
+            break;
+
+          case 'eh':
+            body = '(' +
+              'nwr["operator:wikidata"="Q936287"]["name"];' +
+              'nwr["operator"="English Heritage"]["name"];' +
+              'nwr["operator"="English Heritage Trust"]["name"];' +
+            ');';
+            break;
+
+          case 'ccc':
+            if (isWide) {
+              strategyNote = '50-100mi C&CC: BBox campsite tag + Club filter';
+              body = '(' +
+                'nwr["tourism"="camp_site"]["operator:wikidata"="Q7721188"];' +
+                'nwr["tourism"="caravan_site"]["operator:wikidata"="Q7721188"];' +
+                'nwr["tourism"="camp_site"]["operator"~"Camping and Caravanning Club"];' +
+                'nwr["tourism"="caravan_site"]["operator"~"Camping and Caravanning Club"];' +
+                'nwr["tourism"="camp_site"]["name"~"Camping and Caravanning Club"];' +
+                'nwr["tourism"="caravan_site"]["name"~"Camping and Caravanning Club"];' +
+              ');';
+            } else {
+              strategyNote = '10-25mi C&CC: Fast BBox campsite query + client Club filter';
+              body = '(' +
+                'nwr["tourism"="camp_site"]["name"];' +
+                'nwr["tourism"="caravan_site"]["name"];' +
+              ');';
+            }
+            break;
+
+          case 'castles':
+            body = isWide
+              ? '(nwr["historic"="castle"]["name"];nwr["historic"="ruins"]["wikidata"]["name"];);'
+              : '(nwr["historic"="castle"]["name"];nwr["historic"="ruins"]["name"];);';
+            break;
+
+          case 'museums':
+            body = isWide
+              ? 'nwr["tourism"="museum"]["wikidata"]["name"];'
+              : 'nwr["tourism"="museum"]["name"];';
+            break;
+
+          case 'nature':
+            body = isWide
+              ? 'nwr["leisure"="nature_reserve"]["wikidata"]["name"];'
+              : 'nwr["leisure"="nature_reserve"]["name"];';
+            break;
+
+          case 'parks':
+            body = '(' +
+              'nwr["designation"="country_park"]["name"];' +
+              'nwr["leisure"="park"]["name"~"Country Park"];' +
+            ');';
+            break;
+
+          case 'viewpoints':
+            body = isWide
+              ? 'nwr["tourism"="viewpoint"]["wikidata"]["name"];'
+              : 'nwr["tourism"="viewpoint"]["name"];';
+            break;
+
+          case 'all':
+            if (isWide) {
+              strategyNote = '50-100mi Tiered All: NT, EH, C&CC, Parks & Wikidata Castles/Museums';
+              body = '(' +
+                'nwr["operator:wikidata"="Q333515"]["name"];' +
+                'nwr["operator"="National Trust"]["name"];' +
+                'nwr["operator:wikidata"="Q936287"]["name"];' +
+                'nwr["operator"="English Heritage"]["name"];' +
+                'nwr["tourism"="camp_site"]["operator"~"Camping and Caravanning Club"];' +
+                'nwr["tourism"="caravan_site"]["operator"~"Camping and Caravanning Club"];' +
+                'nwr["historic"="castle"]["wikidata"]["name"];' +
+                'nwr["tourism"="museum"]["wikidata"]["name"];' +
+                'nwr["designation"="country_park"]["name"];' +
+              ');';
+            } else {
+              body = '(' +
+                'nwr["operator:wikidata"="Q333515"]["name"];' +
+                'nwr["operator"="National Trust"]["name"];' +
+                'nwr["operator:wikidata"="Q936287"]["name"];' +
+                'nwr["operator"="English Heritage"]["name"];' +
+                'nwr["tourism"="camp_site"]["name"];' +
+                'nwr["tourism"="caravan_site"]["name"];' +
+                'nwr["historic"="castle"]["name"];' +
+                'nwr["historic"="ruins"]["name"];' +
+                'nwr["tourism"="museum"]["name"];' +
+                'nwr["leisure"="nature_reserve"]["name"];' +
+                'nwr["designation"="country_park"]["name"];' +
+                'nwr["tourism"="viewpoint"]["name"];' +
+              ');';
+            }
+            break;
+        }
+
+        const ql = '[out:json][timeout:' + serverTimeout + '][bbox:' + bbox + '];' + body + 'out center qt;';
+        return { ql: ql, strategyNote: strategyNote };
+      }
+
+      // 6. Membership Evaluator
+      function evaluateMembership(tags) {
+        const op = (tags.operator || '').trim();
+        const opWiki = (tags['operator:wikidata'] || '').trim();
+        const brand = (tags.brand || '').trim();
+        const owner = (tags.owner || '').trim();
+        const name = (tags.name || '').trim();
+        const heritageOp = (tags['heritage:operator'] || '').trim();
+        const website = (tags.website || tags['contact:website'] || '').trim();
+
+        const opLower = op.toLowerCase();
+        const brandLower = brand.toLowerCase();
+        const ownerLower = owner.toLowerCase();
+        const nameLower = name.toLowerCase();
+        const heritageLower = heritageOp.toLowerCase();
+        const webLower = website.toLowerCase();
+
+        // National Trust
+        const isNtExact = opWiki === 'Q333515' || opWiki === 'Q1968638' ||
+          /^(the\s+)?national trust(\s+for\s+scotland)?$/i.test(op) ||
+          /^(the\s+)?national trust$/i.test(brand);
+
+        if (isNtExact) return { org: 'National Trust', status: 'verified', reason: 'Verified via operator tag' };
+        if (opLower.includes('national trust') || ownerLower.includes('national trust') || webLower.includes('nationaltrust.org.uk')) {
+          return { org: 'National Trust', status: 'uncertain', reason: 'Uncertain match (owner/website reference)' };
+        }
+
+        // English Heritage
+        const isEhExact = opWiki === 'Q936287' || /^english heritage(\s+trust)?$/i.test(op) || /^english heritage$/i.test(brand);
+        if (isEhExact) return { org: 'English Heritage', status: 'verified', reason: 'Verified via operator tag' };
+        if (opLower.includes('english heritage') || ownerLower.includes('english heritage') || webLower.includes('english-heritage.org.uk')) {
+          return { org: 'English Heritage', status: 'uncertain', reason: 'Uncertain match (owner/website reference)' };
+        }
+        if (heritageLower.includes('english heritage') || heritageLower.includes('historic england')) {
+          return { org: 'None', status: 'uncertain', reason: 'Listed monument (' + heritageOp + ') - not verified as EH visitor property' };
+        }
+
+        // Camping and Caravanning Club
+        const isCccExact = opWiki === 'Q7721188' ||
+          opLower.includes('camping and caravanning club') ||
+          opLower.includes('camping & caravanning club') ||
+          brandLower.includes('camping and caravanning club');
+
+        if (isCccExact) return { org: 'C&CC', status: 'verified', reason: 'Verified via Club operator/brand tag' };
+        if (nameLower.includes('camping and caravanning club') || nameLower.includes('camping & caravanning club') || webLower.includes('campingandcaravanningclub.co.uk')) {
+          return { org: 'C&CC', status: 'uncertain', reason: 'Uncertain match (matched by site name/website)' };
+        }
+
+        return { org: 'None', status: 'none', reason: 'No membership operator tags' };
+      }
+
+      function isExcludedMinorAsset(tags) {
+        const amenity = tags.amenity || '';
+        if (amenity === 'parking' || amenity === 'bench' || amenity === 'toilets' || amenity === 'waste_basket' || amenity === 'cafe' || amenity === 'fast_food') return true;
+        if (tags.highway === 'bus_stop' || tags.shop || tags.building === 'residential' || tags.building === 'house') return true;
+        return false;
+      }
+
+      function classifyCategory(tags, membership) {
+        if (membership.org === 'National Trust' && membership.status === 'verified') return 'National Trust';
+        if (membership.org === 'English Heritage' && membership.status === 'verified') return 'English Heritage';
+        if (membership.org === 'C&CC') return 'C&CC Campsite';
+        if (tags.historic === 'castle') return 'Castle';
+        if (tags.historic === 'ruins') return 'Historic Ruins';
+        if (tags.tourism === 'museum') return 'Museum';
+        if (tags.designation === 'country_park' || /country park/i.test(tags.name || '')) return 'Country Park';
+        if (tags.leisure === 'nature_reserve') return 'Nature Reserve';
+        if (tags.tourism === 'viewpoint') return 'Viewpoint';
+        if (tags.tourism === 'camp_site' || tags.tourism === 'caravan_site') return 'Campsite';
+        return 'Place of Interest';
+      }
+
+      function calcMiles(lat1, lon1, lat2, lon2) {
+        const R = 3958.8;
+        const dLat = (lat2 - lat1) * Math.PI / 180;
+        const dLon = (lon2 - lon1) * Math.PI / 180;
+        const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                  Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                  Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      }
+
+      function processElements(elements, centerLat, centerLon, radiusMiles, selectedCategory) {
+        const seenOsmIds = new Set();
+        const dedupedList = [];
+        let merged = 0;
+
+        for (let i = 0; i < elements.length; i++) {
+          const el = elements[i];
+          const osmKey = el.type + '_' + el.id;
+
+          if (seenOsmIds.has(osmKey)) continue;
+          seenOsmIds.add(osmKey);
+
+          const elLat = typeof el.lat === 'number' ? el.lat : (el.center && typeof el.center.lat === 'number' ? el.center.lat : null);
+          const elLon = typeof el.lon === 'number' ? el.lon : (el.center && typeof el.center.lon === 'number' ? el.center.lon : null);
+          if (elLat === null || elLon === null) continue;
+
+          const distMiles = calcMiles(centerLat, centerLon, elLat, elLon);
+          if (distMiles > radiusMiles) continue;
+
+          const tags = el.tags || {};
+          const name = (tags.name || '').trim();
+          if (!name || isExcludedMinorAsset(tags)) continue;
+
+          const membership = evaluateMembership(tags);
+
+          if (selectedCategory === 'ccc' && membership.org !== 'C&CC') continue;
+          if (selectedCategory === 'all' && (tags.tourism === 'camp_site' || tags.tourism === 'caravan_site') && membership.org !== 'C&CC') continue;
+
+          const candidate = {
+            id: osmKey,
+            osmType: el.type,
+            osmId: el.id,
+            name: name,
+            lat: elLat,
+            lon: elLon,
+            miles: Number(distMiles.toFixed(1)),
+            type: classifyCategory(tags, membership),
+            membershipOrg: membership.org,
+            membershipStatus: membership.status,
+            membershipReason: membership.reason,
+            operator: tags.operator || tags['operator:wikidata'] || 'Unlisted',
+            fee: tags.fee || 'Unlisted'
+          };
+
+          const normName = name.toLowerCase();
+          let isDuplicate = false;
+          for (let j = 0; j < dedupedList.length; j++) {
+            if (dedupedList[j].name.toLowerCase() === normName) {
+              if (calcMiles(dedupedList[j].lat, dedupedList[j].lon, candidate.lat, candidate.lon) <= 0.1) {
+                isDuplicate = true;
+                merged++;
+                if (dedupedList[j].membershipStatus !== 'verified' && candidate.membershipStatus === 'verified') {
+                  dedupedList[j] = candidate;
+                }
+                break;
+              }
+            }
+          }
+
+          if (!isDuplicate) dedupedList.push(candidate);
+        }
+
+        dedupedList.sort(function(a, b) { return a.miles - b.miles; });
+
+        return {
+          all: dedupedList,
+          rendered: dedupedList.slice(0, MAX_UI_RENDER),
+          merged: merged
+        };
+      }
+
+      // 7. Search Execution with Live Button Countdown
+      async function runPoCTest() {
+        const btn = document.getElementById('searchBtn');
+        const inputVal = document.getElementById('locationInput').value;
+        const radius = parseInt(document.getElementById('radiusSelect').value, 10);
+        const category = document.getElementById('categorySelect').value;
+
+        btn.disabled = true;
+        logTelemetry('Step 1/2: Resolving location...', false);
+
+        try {
+          const geo = await geocodeInput(inputVal);
+          lastSearchMeta = { lat: geo.lat, lon: geo.lon, radius: radius };
+
+          const querySpec = buildOverpassQuery(category, geo.lat, geo.lon, radius);
+          const t0 = performance.now();
+
+          // Live elapsed timer directly on button so you know the connection is active
+          let elapsedSec = 0;
+          btn.textContent = 'Waiting in Overpass queue (' + elapsedSec + 's)...';
+          timerInterval = setInterval(function() {
+            elapsedSec++;
+            btn.textContent = 'Waiting in Overpass queue (' + elapsedSec + 's)...';
+          }, 1000);
+
+          logTelemetry(
+            'Location OK (' + geo.source + '): ' + geo.label + ' [' + geo.lat.toFixed(4) + ', ' + geo.lon.toFixed(4) + ']\n' +
+            'Step 2/2: Connected to overpass-api.de. Waiting for server queue slot (typically ~25-45s)...',
+            false
+          );
+
+          const res = await fetchWithTimeout(
+            OVERPASS_ENDPOINT,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+              body: 'data=' + encodeURIComponent(querySpec.ql)
+            },
+            CLIENT_TIMEOUT_MS
+          );
+
+          clearInterval(timerInterval);
+          btn.textContent = 'Processing results...';
+          const totalMs = Math.round(performance.now() - t0);
+
+          if (res.status === 502) {
+            throw new Error('Overpass server at capacity (HTTP 502). All query workers are busy. Please wait 15-30 seconds and retry.');
+          }
+          if (res.status === 429) {
+            throw new Error('Overpass rate limit reached (HTTP 429). Please wait a moment.');
+          }
+          if (!res.ok) {
+            throw new Error('Overpass error (HTTP ' + res.status + ').');
+          }
+
+          const data = await res.json();
+          if (data.remark && data.remark.toLowerCase().includes('timed out')) {
+            throw new Error('Overpass server execution timeout: ' + data.remark);
+          }
+
+          const rawElements = Array.isArray(data.elements) ? data.elements : [];
+          const processed = processElements(rawElements, geo.lat, geo.lon, radius, category);
+          currentResults = processed.rendered;
+
+          switchTab('results');
+
+          logTelemetry(
+            'Target: ' + geo.label + ' (' + geo.source + ' in ' + geo.ms + 'ms)\n' +
+            'Overpass response: ' + totalMs + 'ms (' + (totalMs / 1000).toFixed(1) + 's total wait)\n' +
+            'Places found within ' + radius + ' miles: ' + processed.all.length +
+            (processed.all.length > MAX_UI_RENDER ? ' (Capped to ' + MAX_UI_RENDER + ' closest)' : '') + '\n' +
+            'Duplicates merged: ' + processed.merged + '\n' +
+            'Strategy: ' + querySpec.strategyNote,
+            false
+          );
+        } catch (err) {
+          clearInterval(timerInterval);
+          logTelemetry('ERROR: ' + err.message, true);
+        } finally {
+          clearInterval(timerInterval);
+          btn.disabled = false;
+          btn.textContent = 'Run Technical Test';
+        }
+      }
+
+      // 8. Leaflet Map & List Rendering
+      function buildPopupElement(item) {
+        const wrap = document.createElement('div');
+        const title = document.createElement('strong');
+        title.textContent = item.name;
+        wrap.appendChild(title);
+        wrap.appendChild(document.createElement('br'));
+
+        const sub = document.createElement('span');
+        sub.textContent = item.type + ' • ' + item.miles + ' miles';
+        wrap.appendChild(sub);
+        wrap.appendChild(document.createElement('br'));
+
+        const mem = document.createElement('span');
+        mem.textContent = 'Membership: ' + item.membershipOrg + ' [' + item.membershipStatus.toUpperCase() + ']';
+        wrap.appendChild(mem);
+        return wrap;
+      }
+
+      function renderMapForActiveList(items) {
+        markersLayer.clearLayers();
+        markerById.clear();
+        if (centerCircle) {
+          map.removeLayer(centerCircle);
+          centerCircle = null;
+        }
+
+        if (activeTab === 'results' && lastSearchMeta) {
+          centerCircle = L.circle([lastSearchMeta.lat, lastSearchMeta.lon], {
+            radius: lastSearchMeta.radius * 1609.34,
+            color: '#1d4ed8',
+            weight: 1,
+            fillOpacity: 0.05
+          }).addTo(map);
+        }
+
+        const boundsPoints = [];
+        items.forEach(function(item) {
+          if (typeof item.lat !== 'number' || typeof item.lon !== 'number') return;
+          const marker = L.marker([item.lat, item.lon]);
+          marker.bindPopup(buildPopupElement(item));
+          marker.addTo(markersLayer);
+          markerById.set(item.id, marker);
+          boundsPoints.push([item.lat, item.lon]);
+        });
+
+        if (activeTab === 'results' && centerCircle) {
+          map.fitBounds(centerCircle.getBounds());
+        } else if (boundsPoints.length > 0) {
+          map.fitBounds(L.latLngBounds(boundsPoints), { padding: [25, 25], maxZoom: 13 });
+        }
+      }
+
+      function focusLocationOnMap(item) {
+        if (!map) return;
+        map.setView([item.lat, item.lon], 14);
+        const marker = markerById.get(item.id);
+        if (marker) marker.openPopup();
+      }
+
+      function toggleFav(item) {
+        let favs = getFavs();
+        const exists = favs.some(function(f) { return f.id === item.id; });
+        if (exists) {
+          favs = favs.filter(function(f) { return f.id !== item.id; });
+        } else {
+          favs.push(item);
+        }
+        saveFavs(favs);
+        updateCounts();
+        renderActiveView();
+      }
+
+      function updateCounts() {
+        document.getElementById('resCount').textContent = String(currentResults.length);
+        document.getElementById('favCount').textContent = String(getFavs().length);
+      }
+
+      function switchTab(tab) {
+        activeTab = tab;
+        document.getElementById('tabResults').classList.toggle('active', tab === 'results');
+        document.getElementById('tabFavs').classList.toggle('active', tab === 'favs');
+        renderActiveView();
+      }
+
+      function renderActiveView() {
+        updateCounts();
+        const favs = getFavs();
+        const favIds = new Set(favs.map(function(f) { return f.id; }));
+        const activeList = activeTab === 'results' ? currentResults : favs;
+
+        renderMapForActiveList(activeList);
+
+        const container = document.getElementById('listContainer');
+        container.replaceChildren();
+
+        if (activeList.length === 0) {
+          const emptyPanel = document.createElement('div');
+          emptyPanel.className = 'panel';
+          emptyPanel.textContent = activeTab === 'results'
+            ? 'No matching locations found within the selected radius.'
+            : 'No saved favourites yet. Tap Save on any result to test persistence.';
+          container.appendChild(emptyPanel);
+          return;
+        }
+
+        const fragment = document.createDocumentFragment();
+
+        activeList.forEach(function(item) {
+          const card = document.createElement('div');
+          card.className = 'card';
+
+          const info = document.createElement('div');
+          info.className = 'card-info';
+          info.addEventListener('click', function() { focusLocationOnMap(item); });
+
+          const title = document.createElement('div');
+          title.className = 'card-title';
+          title.textContent = item.name;
+          info.appendChild(title);
+
+          const meta = document.createElement('div');
+          meta.className = 'card-meta';
+
+          const typeBadge = document.createElement('span');
+          typeBadge.className = 'badge type';
+          typeBadge.textContent = item.type;
+          meta.appendChild(typeBadge);
+
+          if (item.membershipStatus === 'verified') {
+            const memBadge = document.createElement('span');
+            memBadge.className = 'badge verified';
+            memBadge.textContent = 'Verified: ' + item.membershipOrg;
+            meta.appendChild(memBadge);
+          } else if (item.membershipStatus === 'uncertain') {
+            const memBadge = document.createElement('span');
+            memBadge.className = 'badge uncertain';
+            memBadge.textContent = item.membershipOrg !== 'None' ? 'Uncertain: ' + item.membershipOrg : 'Uncertain Operator';
+            meta.appendChild(memBadge);
+          }
+
+          const detailsText = document.createElement('div');
+          const distText = typeof item.miles === 'number' ? item.miles + ' miles • ' : '';
+          detailsText.textContent = distText + 'ID: ' + item.id + ' • Op: ' + item.operator + ' • Fee: ' + item.fee;
+          meta.appendChild(detailsText);
+
+          info.appendChild(meta);
+          card.appendChild(info);
+
+          const isSaved = favIds.has(item.id);
+          const favBtn = document.createElement('button');
+          favBtn.type = 'button';
+          favBtn.className = 'fav-btn' + (isSaved ? ' saved' : '');
+          favBtn.textContent = isSaved ? 'Saved' : 'Save';
+          favBtn.addEventListener('click', function() { toggleFav(item); });
+
+          card.appendChild(favBtn);
+          fragment.appendChild(card);
+        });
+
+        container.appendChild(fragment);
+      }
+
+      function init() {
+        map = L.map('map').setView([51.372, -2.138], 9);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 18,
+          attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+        markersLayer = L.layerGroup().addTo(map);
+
+        document.getElementById('searchBtn').addEventListener('click', runPoCTest);
+        document.getElementById('tabResults').addEventListener('click', function() { switchTab('results'); });
+        document.getElementById('tabFavs').addEventListener('click', function() { switchTab('favs'); });
+        document.getElementById('locationInput').addEventListener('keydown', function(e) {
+          if (e.key === 'Enter') runPoCTest();
+        });
+
+        const storageStatus = checkStorage();
+        updateCounts();
+        logTelemetry(
+          'Protocol: ' + window.location.protocol + '\n' +
+          'Storage Active: ' + storageStatus + '\n' +
+          'Overpass Target: overpass-api.de (60s wait ceiling)\n' +
+          'Ready. Enter a UK postcode or town and tap Run Technical Test.',
+          false
+        );
+      }
+
+      window.addEventListener('DOMContentLoaded', init);
+    })();
+  </script>
+</body>
+</html>
